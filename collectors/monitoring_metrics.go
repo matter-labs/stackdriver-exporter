@@ -14,12 +14,12 @@
 package collectors
 
 import (
+	"log/slog"
+	"sort"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/api/monitoring/v3"
-
-	"sort"
 
 	"github.com/prometheus-community/stackdriver_exporter/hash"
 	"github.com/prometheus-community/stackdriver_exporter/utils"
@@ -45,6 +45,9 @@ type timeSeriesMetrics struct {
 	counterStore    DeltaCounterStore
 	histogramStore  DeltaHistogramStore
 	aggregateDeltas bool
+	logger          *slog.Logger
+
+	deduplicator *MetricDeduplicator
 }
 
 func newTimeSeriesMetrics(descriptor *monitoring.MetricDescriptor,
@@ -52,7 +55,8 @@ func newTimeSeriesMetrics(descriptor *monitoring.MetricDescriptor,
 	fillMissingLabels bool,
 	counterStore DeltaCounterStore,
 	histogramStore DeltaHistogramStore,
-	aggregateDeltas bool) (*timeSeriesMetrics, error) {
+	aggregateDeltas bool,
+	logger *slog.Logger) (*timeSeriesMetrics, error) {
 
 	return &timeSeriesMetrics{
 		metricDescriptor:  descriptor,
@@ -63,6 +67,8 @@ func newTimeSeriesMetrics(descriptor *monitoring.MetricDescriptor,
 		counterStore:      counterStore,
 		histogramStore:    histogramStore,
 		aggregateDeltas:   aggregateDeltas,
+		logger:            logger,
+		deduplicator:      NewMetricDeduplicator(),
 	}, nil
 }
 
@@ -148,6 +154,23 @@ func (t *timeSeriesMetrics) CollectNewConstHistogram(timeSeries *monitoring.Time
 }
 
 func (t *timeSeriesMetrics) newConstHistogram(fqName string, reportTime time.Time, labelKeys []string, sum float64, count uint64, buckets map[float64]uint64, labelValues []string) prometheus.Metric {
+	// Check for duplicates before sending
+	isDuplicate := t.deduplicator.CheckAndMark(fqName, labelKeys, labelValues, reportTime)
+	if isDuplicate {
+		t.logger.Debug("Skipping duplicate histogram metric", "fqName", fqName, "timestamp", reportTime)
+		return nil // Indicate metric should not be sent
+	}
+
+	// Create a map for clearer logging
+	labelMap := make(map[string]string)
+	for i, key := range labelKeys {
+		if i < len(labelValues) {
+			labelMap[key] = labelValues[i]
+		} else {
+			labelMap[key] = "" // Handle potential mismatch, though unlikely here
+		}
+	}
+	t.logger.Debug("Sending histogram metric to channel", "fqName", fqName, "labels", labelMap, "count", count, "sum", sum, "timestamp", reportTime)
 	return prometheus.NewMetricWithTimestamp(
 		reportTime,
 		prometheus.MustNewConstHistogram(
@@ -196,6 +219,23 @@ func (t *timeSeriesMetrics) CollectNewConstMetric(timeSeries *monitoring.TimeSer
 }
 
 func (t *timeSeriesMetrics) newConstMetric(fqName string, reportTime time.Time, labelKeys []string, metricValueType prometheus.ValueType, metricValue float64, labelValues []string) prometheus.Metric {
+	// Check for duplicates before sending
+	isDuplicate := t.deduplicator.CheckAndMark(fqName, labelKeys, labelValues, reportTime)
+	if isDuplicate {
+		t.logger.Debug("Skipping duplicate const metric", "fqName", fqName, "timestamp", reportTime)
+		return nil // Indicate metric should not be sent
+	}
+
+	// Create a map for clearer logging
+	labelMap := make(map[string]string)
+	for i, key := range labelKeys {
+		if i < len(labelValues) {
+			labelMap[key] = labelValues[i]
+		} else {
+			labelMap[key] = "" // Handle potential mismatch
+		}
+	}
+	t.logger.Debug("Sending const metric to channel", "fqName", fqName, "labels", labelMap, "value", metricValue, "timestamp", reportTime) // Updated log
 	return prometheus.NewMetricWithTimestamp(
 		reportTime,
 		prometheus.MustNewConstMetric(
@@ -222,8 +262,8 @@ func hashLabelKeys(labelKeys []string) uint64 {
 func (t *timeSeriesMetrics) Complete(reportingStartTime time.Time) {
 	t.completeDeltaConstMetrics(reportingStartTime)
 	t.completeDeltaHistogramMetrics(reportingStartTime)
-	t.completeConstMetrics(t.constMetrics)
-	t.completeHistogramMetrics(t.histogramMetrics)
+	t.completeConstMetrics(t.constMetrics)    // Handles fillMissingLabels case
+	t.completeHistogramMetrics(t.histogramMetrics) // Handles fillMissingLabels case
 }
 
 func (t *timeSeriesMetrics) completeConstMetrics(constMetrics map[string][]*ConstMetric) {
@@ -241,7 +281,12 @@ func (t *timeSeriesMetrics) completeConstMetrics(constMetrics map[string][]*Cons
 		}
 
 		for _, v := range vs {
-			t.ch <- t.newConstMetric(v.FqName, v.ReportTime, v.LabelKeys, v.ValueType, v.Value, v.LabelValues)
+			// Need to check for duplicates again here if fillMissingLabels is true,
+			// as labels might have changed during filling.
+			metric := t.newConstMetric(v.FqName, v.ReportTime, v.LabelKeys, v.ValueType, v.Value, v.LabelValues)
+			if metric != nil { // Only send if not a duplicate
+				t.ch <- metric
+			}
 		}
 	}
 }
@@ -260,7 +305,12 @@ func (t *timeSeriesMetrics) completeHistogramMetrics(histograms map[string][]*Hi
 			}
 		}
 		for _, v := range vs {
-			t.ch <- t.newConstHistogram(v.FqName, v.ReportTime, v.LabelKeys, v.Sum, v.Count, v.Buckets, v.LabelValues)
+			// Need to check for duplicates again here if fillMissingLabels is true,
+			// as labels might have changed during filling.
+			metric := t.newConstHistogram(v.FqName, v.ReportTime, v.LabelKeys, v.Sum, v.Count, v.Buckets, v.LabelValues)
+			if metric != nil { // Only send if not a duplicate
+				t.ch <- metric
+			}
 		}
 	}
 }
@@ -285,7 +335,8 @@ func (t *timeSeriesMetrics) completeDeltaConstMetrics(reportingStartTime time.Ti
 			}
 			constMetrics[collected.FqName] = append(constMetrics[collected.FqName], collected)
 		} else {
-			t.ch <- t.newConstMetric(
+			// Check for duplicates before sending delta metrics directly
+			metric := t.newConstMetric(
 				collected.FqName,
 				collected.ReportTime,
 				collected.LabelKeys,
@@ -293,6 +344,9 @@ func (t *timeSeriesMetrics) completeDeltaConstMetrics(reportingStartTime time.Ti
 				collected.Value,
 				collected.LabelValues,
 			)
+			if metric != nil { // Only send if not a duplicate
+				t.ch <- metric
+			}
 		}
 	}
 
@@ -321,7 +375,8 @@ func (t *timeSeriesMetrics) completeDeltaHistogramMetrics(reportingStartTime tim
 			}
 			histograms[collected.FqName] = append(histograms[collected.FqName], collected)
 		} else {
-			t.ch <- t.newConstHistogram(
+			// Check for duplicates before sending delta histograms directly
+			metric := t.newConstHistogram(
 				collected.FqName,
 				collected.ReportTime,
 				collected.LabelKeys,
@@ -330,6 +385,9 @@ func (t *timeSeriesMetrics) completeDeltaHistogramMetrics(reportingStartTime tim
 				collected.Buckets,
 				collected.LabelValues,
 			)
+			if metric != nil { // Only send if not a duplicate
+				t.ch <- metric
+			}
 		}
 	}
 
