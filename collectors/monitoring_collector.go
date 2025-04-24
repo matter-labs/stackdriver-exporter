@@ -415,6 +415,7 @@ func (c *MonitoringCollector) reportTimeSeriesMetrics(
 		c.counterStore,
 		c.histogramStore,
 		c.aggregateDeltas,
+		c.logger, // Pass logger
 	)
 	if err != nil {
 		return fmt.Errorf("error creating the TimeSeriesMetrics %v", err)
