@@ -1,8 +1,6 @@
 package collectors
 
 import (
-	"sort"
-	"strconv"
 	"time"
 
 	"github.com/prometheus-community/stackdriver_exporter/hash"
@@ -30,7 +28,7 @@ func (d *MetricDeduplicator) CheckAndMark(fqName string, labelKeys, labelValues 
 		return true // Duplicate detected
 	}
 	d.sentSignatures[signature] = struct{}{} // Mark as seen
-	return false // Not a duplicate
+	return false                             // Not a duplicate
 }
 
 // hashLabelsTimestamp calculates a hash based on FQName, sorted labels, and timestamp.
@@ -39,37 +37,44 @@ func (d *MetricDeduplicator) hashLabelsTimestamp(fqName string, labelKeys, label
 	dh = hash.Add(dh, fqName)
 	dh = hash.AddByte(dh, hash.SeparatorByte)
 
-	// Create label pairs for stable sorting
-	pairs := make([]struct {
-		Key   string
-		Value string
-	}, len(labelKeys))
-	for i, key := range labelKeys {
-		// Ensure we don't go out of bounds if labelValues is shorter (shouldn't happen in normal flow)
-		val := ""
-		if i < len(labelValues) {
-			val = labelValues[i]
-		}
-		pairs[i] = struct {
-			Key   string
-			Value string
-		}{Key: key, Value: val}
+	// Create indices for stable sorting
+	indices := make([]int, len(labelKeys))
+	for i := range indices {
+		indices[i] = i
 	}
 
-	// Sort pairs by key
-	sort.Slice(pairs, func(i, j int) bool {
-		return pairs[i].Key < pairs[j].Key
-	})
+	// Sort indices by key using a simple insertion sort
+	// This is faster for small slices than sort.Slice
+	for i := 0; i < len(indices); i++ {
+		for j := i + 1; j < len(indices); j++ {
+			if labelKeys[indices[i]] > labelKeys[indices[j]] {
+				indices[i], indices[j] = indices[j], indices[i]
+			}
+		}
+	}
 
 	// Add sorted key-value pairs to hash
-	for _, pair := range pairs {
-		dh = hash.Add(dh, pair.Key)
+	for _, idx := range indices {
+		dh = hash.Add(dh, labelKeys[idx])
 		dh = hash.AddByte(dh, hash.SeparatorByte)
-		dh = hash.Add(dh, pair.Value)
+
+		// Ensure we don't go out of bounds if labelValues is shorter
+		if idx < len(labelValues) {
+			dh = hash.Add(dh, labelValues[idx])
+		}
 		dh = hash.AddByte(dh, hash.SeparatorByte)
 	}
 
-	// Add timestamp (converted to string)
-	dh = hash.Add(dh, strconv.FormatInt(ts.UnixNano(), 10))
+	// Add timestamp using binary operations instead of string conversion
+	tsNano := ts.UnixNano()
+
+	// Mix in the timestamp bytes directly using the FNV-1a algorithm
+	dh = hash.AddUint64(dh, uint64(tsNano))
+
+	// Mix in the high bits if they exist (for timestamps far in the future)
+	if tsNano > 0xFFFFFFFF {
+		dh = hash.AddUint64(dh, uint64(tsNano>>32))
+	}
+
 	return dh
 }
